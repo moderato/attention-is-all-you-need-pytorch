@@ -14,12 +14,25 @@ import os
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from torchtext.data import Field, Dataset, BucketIterator
-from torchtext.datasets import TranslationDataset
+from torchtext.legacy.data import Field, Dataset, BucketIterator
+from torchtext.legacy.datasets import TranslationDataset
 
 import transformer.Constants as Constants
 from transformer.Models import Transformer
 from transformer.Optim import ScheduledOptim
+
+import torch.autograd.profiler as profiler
+from torch.autograd.profiler import record_function
+
+import graph_observer
+from caffe2.python import core
+core.GlobalInit(
+    [
+        "python",
+        "--pytorch_enable_execution_graph_observer=true",
+        "--pytorch_execution_graph_observer_iter_label=## BENCHMARK ##",
+    ]
+)
 
 __author__ = "Yu-Hsiang Huang"
 
@@ -76,21 +89,28 @@ def train_epoch(model, training_data, optimizer, opt, device, smoothing):
     total_loss, n_word_total, n_word_correct = 0, 0, 0 
 
     desc = '  - (Training)   '
+    count = 0
     for batch in tqdm(training_data, mininterval=2, desc=desc, leave=False):
+        if opt.truncate and count > 2:
+            break
+        count += 1
 
         # prepare data
-        src_seq = patch_src(batch.src, opt.src_pad_idx).to(device)
-        trg_seq, gold = map(lambda x: x.to(device), patch_trg(batch.trg, opt.trg_pad_idx))
+        with record_function("## Prepare data ##"):
+            src_seq = patch_src(batch.src, opt.src_pad_idx).to(device)
+            trg_seq, gold = map(lambda x: x.to(device), patch_trg(batch.trg, opt.trg_pad_idx))
 
         # forward
-        optimizer.zero_grad()
-        pred = model(src_seq, trg_seq)
+        with record_function("## Forward ##"):
+            optimizer.zero_grad()
+            pred = model(src_seq, trg_seq)
 
         # backward and update parameters
-        loss, n_correct, n_word = cal_performance(
-            pred, gold, opt.trg_pad_idx, smoothing=smoothing) 
-        loss.backward()
-        optimizer.step_and_update_lr()
+        with record_function("## Backward ##"):
+            loss, n_correct, n_word = cal_performance(
+                pred, gold, opt.trg_pad_idx, smoothing=smoothing) 
+            loss.backward()
+            optimizer.step_and_update_lr()
 
         # note keeping
         n_word_total += n_word
@@ -158,52 +178,68 @@ def train(model, training_data, validation_data, optimizer, device, opt):
 
     #valid_accus = []
     valid_losses = []
-    for epoch_i in range(opt.epoch):
-        print('[ Epoch', epoch_i, ']')
+    with profiler.profile(opt.profile, use_cuda=opt.cuda, use_kineto=True) as prof:
+        class dummy_record_function():
+            def __enter__(self):
+                return None
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
 
-        start = time.time()
-        train_loss, train_accu = train_epoch(
-            model, training_data, optimizer, opt, device, smoothing=opt.label_smoothing)
-        train_ppl = math.exp(min(train_loss, 100))
-        # Current learning rate
-        lr = optimizer._optimizer.param_groups[0]['lr']
-        print_performances('Training', train_ppl, train_accu, start, lr)
+        for epoch_i in range(opt.epoch):
+            print('[ Epoch', epoch_i, ']')
+            with record_function("## BENCHMARK ##") if opt.collect_execution_graph else dummy_record_function():
+                start = time.time()
+                train_loss, train_accu = train_epoch(
+                    model, training_data, optimizer, opt, device, smoothing=opt.label_smoothing)
+                train_ppl = math.exp(min(train_loss, 100))
+                # Current learning rate
+                lr = optimizer._optimizer.param_groups[0]['lr']
+                print_performances('Training', train_ppl, train_accu, start, lr)
 
-        start = time.time()
-        valid_loss, valid_accu = eval_epoch(model, validation_data, device, opt)
-        valid_ppl = math.exp(min(valid_loss, 100))
-        print_performances('Validation', valid_ppl, valid_accu, start, lr)
+                if opt.eval:
+                    start = time.time()
+                    valid_loss, valid_accu = eval_epoch(model, validation_data, device, opt)
+                    valid_ppl = math.exp(min(valid_loss, 100))
+                    print_performances('Validation', valid_ppl, valid_accu, start, lr)
+                    valid_losses += [valid_loss]
 
-        valid_losses += [valid_loss]
+                checkpoint = {'epoch': epoch_i, 'settings': opt, 'model': model.state_dict()}
 
-        checkpoint = {'epoch': epoch_i, 'settings': opt, 'model': model.state_dict()}
+                if opt.save_mode == 'all':
+                    assert opt.eval
+                    model_name = 'model_accu_{accu:3.3f}.chkpt'.format(accu=100*valid_accu)
+                    torch.save(checkpoint, model_name)
+                elif opt.save_mode == 'best':
+                    assert opt.eval
+                    model_name = 'model.chkpt'
+                    if valid_loss <= min(valid_losses):
+                        torch.save(checkpoint, os.path.join(opt.output_dir, model_name))
+                        print('    - [Info] The checkpoint file has been updated.')
 
-        if opt.save_mode == 'all':
-            model_name = 'model_accu_{accu:3.3f}.chkpt'.format(accu=100*valid_accu)
-            torch.save(checkpoint, model_name)
-        elif opt.save_mode == 'best':
-            model_name = 'model.chkpt'
-            if valid_loss <= min(valid_losses):
-                torch.save(checkpoint, os.path.join(opt.output_dir, model_name))
-                print('    - [Info] The checkpoint file has been updated.')
+                with open(log_train_file, 'a') as log_tf, open(log_valid_file, 'a') as log_vf:
+                    log_tf.write('{epoch},{loss: 8.5f},{ppl: 8.5f},{accu:3.3f}\n'.format(
+                        epoch=epoch_i, loss=train_loss,
+                        ppl=train_ppl, accu=100*train_accu))
+                    if opt.eval:
+                        log_vf.write('{epoch},{loss: 8.5f},{ppl: 8.5f},{accu:3.3f}\n'.format(
+                            epoch=epoch_i, loss=valid_loss,
+                            ppl=valid_ppl, accu=100*valid_accu))
 
-        with open(log_train_file, 'a') as log_tf, open(log_valid_file, 'a') as log_vf:
-            log_tf.write('{epoch},{loss: 8.5f},{ppl: 8.5f},{accu:3.3f}\n'.format(
-                epoch=epoch_i, loss=train_loss,
-                ppl=train_ppl, accu=100*train_accu))
-            log_vf.write('{epoch},{loss: 8.5f},{ppl: 8.5f},{accu:3.3f}\n'.format(
-                epoch=epoch_i, loss=valid_loss,
-                ppl=valid_ppl, accu=100*valid_accu))
+                if opt.use_tb:
+                    assert opt.eval
+                    tb_writer.add_scalars('ppl', {'train': train_ppl, 'val': valid_ppl}, epoch_i)
+                    tb_writer.add_scalars('accuracy', {'train': train_accu*100, 'val': valid_accu*100}, epoch_i)
+                    tb_writer.add_scalar('learning_rate', lr, epoch_i)
 
-        if opt.use_tb:
-            tb_writer.add_scalars('ppl', {'train': train_ppl, 'val': valid_ppl}, epoch_i)
-            tb_writer.add_scalars('accuracy', {'train': train_accu*100, 'val': valid_accu*100}, epoch_i)
-            tb_writer.add_scalar('learning_rate', lr, epoch_i)
+    if opt.profile:
+        with open("transformer_benchmark.prof", "w") as prof_f:
+            prof_f.write(prof.key_averages().table(sort_by="self_cpu_time_total"))
+        prof.export_chrome_trace("transformer_benchmark.json")
 
 def main():
     ''' 
     Usage:
-    python train.py -data_pkl m30k_deen_shr.pkl -log m30k_deen_shr -embs_share_weight -proj_share_weight -label_smoothing -output_dir output -b 256 -warmup 128000
+    python train.py -data_pkl m30k_deen_shr.pkl -embs_share_weight -proj_share_weight -label_smoothing -output_dir output -b 256 -warmup 128000
     '''
 
     parser = argparse.ArgumentParser()
@@ -233,14 +269,19 @@ def main():
     parser.add_argument('-scale_emb_or_prj', type=str, default='prj')
 
     parser.add_argument('-output_dir', type=str, default=None)
-    parser.add_argument('-use_tb', action='store_true')
-    parser.add_argument('-save_mode', type=str, choices=['all', 'best'], default='best')
+    parser.add_argument('-use_tb', action='store_true', default=False)
+    parser.add_argument('-save_mode', type=str, choices=['all', 'best', None], default=None)
 
-    parser.add_argument('-no_cuda', action='store_true')
-    parser.add_argument('-label_smoothing', action='store_true')
+    parser.add_argument('-no_cuda', action='store_true', default=False)
+    parser.add_argument('-label_smoothing', action='store_true', default=False)
+    parser.add_argument('-no_eval', action='store_true', default=False)
+    parser.add_argument('-profile', action='store_true', default=False)
+    parser.add_argument('-collect_execution_graph', action='store_true', default=False)
+    parser.add_argument('-truncate', action='store_true', default=False, help='Truncate the dataset for benchmark purpose')
 
     opt = parser.parse_args()
     opt.cuda = not opt.no_cuda
+    opt.eval = not opt.no_eval
     opt.d_word_vec = opt.d_model
 
     # https://pytorch.org/docs/stable/notes/randomness.html

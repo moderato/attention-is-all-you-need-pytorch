@@ -89,11 +89,7 @@ def train_epoch(model, training_data, optimizer, opt, device, smoothing):
     total_loss, n_word_total, n_word_correct = 0, 0, 0 
 
     desc = '  - (Training)   '
-    count = 0
     for batch in tqdm(training_data, mininterval=2, desc=desc, leave=False):
-        if opt.truncate and count > 2:
-            break
-        count += 1
 
         # prepare data
         with record_function("## Prepare data ##"):
@@ -104,6 +100,7 @@ def train_epoch(model, training_data, optimizer, opt, device, smoothing):
         with record_function("## Forward ##"):
             optimizer.zero_grad()
             pred = model(src_seq, trg_seq)
+            print(src_seq.shape, trg_seq.shape)
 
         # backward and update parameters
         with record_function("## Backward ##"):
@@ -116,6 +113,9 @@ def train_epoch(model, training_data, optimizer, opt, device, smoothing):
         n_word_total += n_word
         n_word_correct += n_correct
         total_loss += loss.item()
+
+        if opt.collect_execution_graph:
+            break
 
     loss_per_word = total_loss/n_word_total
     accuracy = n_word_correct/n_word_total
@@ -277,7 +277,6 @@ def main():
     parser.add_argument('-no_eval', action='store_true', default=False)
     parser.add_argument('-profile', action='store_true', default=False)
     parser.add_argument('-collect_execution_graph', action='store_true', default=False)
-    parser.add_argument('-truncate', action='store_true', default=False, help='Truncate the dataset for benchmark purpose')
 
     opt = parser.parse_args()
     opt.cuda = not opt.no_cuda
@@ -337,7 +336,7 @@ def main():
         scale_emb_or_prj=opt.scale_emb_or_prj).to(device)
 
     optimizer = ScheduledOptim(
-        optim.Adam(transformer.parameters(), betas=(0.9, 0.98), eps=1e-09),
+        optim.SGD(transformer.parameters(), lr=0.005, momentum=0.9),
         opt.lr_mul, opt.d_model, opt.n_warmup_steps)
 
     train(transformer, training_data, validation_data, optimizer, device, opt)

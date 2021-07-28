@@ -54,7 +54,16 @@ class Encoder(nn.Module):
 
         super().__init__()
 
-        self.src_word_emb = nn.Embedding(n_src_vocab, d_word_vec, padding_idx=pad_idx)
+        import transformer.table_batched_embeddings_ops as table_batched_embeddings_ops
+        self.src_word_emb = table_batched_embeddings_ops.TableBatchedEmbeddingBags(
+            1,
+            n_src_vocab,
+            d_word_vec,
+            optimizer=table_batched_embeddings_ops.Optimizer.SGD,
+            learning_rate=0.1,
+            eps=0.1,
+            stochastic_rounding=False,
+        )
         self.position_enc = PositionalEncoding(d_word_vec, n_position=n_position)
         self.dropout = nn.Dropout(p=dropout)
         self.layer_stack = nn.ModuleList([
@@ -69,7 +78,11 @@ class Encoder(nn.Module):
         enc_slf_attn_list = []
 
         # -- Forward
-        enc_output = self.src_word_emb(src_seq)
+        B, S = src_seq.shape
+        src_seq = src_seq.reshape((-1)).int()
+        offsets = torch.tensor(range(B*S+1), dtype=torch.int32).cuda()
+        enc_output = self.src_word_emb(src_seq, offsets)
+        enc_output = enc_output.view((B, S, -1))
         if self.scale_emb:
             enc_output *= self.d_model ** 0.5
         enc_output = self.dropout(self.position_enc(enc_output))
@@ -93,7 +106,16 @@ class Decoder(nn.Module):
 
         super().__init__()
 
-        self.trg_word_emb = nn.Embedding(n_trg_vocab, d_word_vec, padding_idx=pad_idx)
+        import transformer.table_batched_embeddings_ops as table_batched_embeddings_ops
+        self.trg_word_emb = table_batched_embeddings_ops.TableBatchedEmbeddingBags(
+            1,
+            n_trg_vocab,
+            d_word_vec,
+            optimizer=table_batched_embeddings_ops.Optimizer.SGD,
+            learning_rate=0.1,
+            eps=0.1,
+            stochastic_rounding=False,
+        )
         self.position_enc = PositionalEncoding(d_word_vec, n_position=n_position)
         self.dropout = nn.Dropout(p=dropout)
         self.layer_stack = nn.ModuleList([
@@ -108,7 +130,11 @@ class Decoder(nn.Module):
         dec_slf_attn_list, dec_enc_attn_list = [], []
 
         # -- Forward
-        dec_output = self.trg_word_emb(trg_seq)
+        B, S = trg_seq.shape
+        trg_seq = trg_seq.reshape((-1)).int()
+        offsets = torch.tensor(range(B*S+1), dtype=torch.int32).cuda()
+        dec_output = self.trg_word_emb(trg_seq, offsets)
+        dec_output = dec_output.view((B, S, -1))
         if self.scale_emb:
             dec_output *= self.d_model ** 0.5
         dec_output = self.dropout(self.position_enc(dec_output))
@@ -178,10 +204,10 @@ class Transformer(nn.Module):
 
         if trg_emb_prj_weight_sharing:
             # Share the weight between target word embedding & last dense layer
-            self.trg_word_prj.weight = self.decoder.trg_word_emb.weight
+            self.trg_word_prj.embedding_weights = self.decoder.trg_word_emb.embedding_weights
 
         if emb_src_trg_weight_sharing:
-            self.encoder.src_word_emb.weight = self.decoder.trg_word_emb.weight
+            self.encoder.src_word_emb.embedding_weights = self.decoder.trg_word_emb.embedding_weights
 
 
     def forward(self, src_seq, trg_seq):

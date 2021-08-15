@@ -100,7 +100,7 @@ def train_epoch(model, training_data, optimizer, opt, device, smoothing):
         with record_function("## Forward ##"):
             optimizer.zero_grad()
             pred = model(src_seq, trg_seq)
-            print(src_seq.shape, trg_seq.shape)
+            # print(src_seq.shape, trg_seq.shape)
 
         # backward and update parameters
         with record_function("## Backward ##"):
@@ -170,11 +170,8 @@ def train(model, training_data, validation_data, optimizer, device, opt):
         log_tf.write('epoch,loss,ppl,accuracy\n')
         log_vf.write('epoch,loss,ppl,accuracy\n')
 
-    def print_performances(header, ppl, accu, start_time, lr):
-        print('  - {header:12} ppl: {ppl: 8.5f}, accuracy: {accu:3.3f} %, lr: {lr:8.5f}, '\
-              'elapse: {elapse:3.3f} min'.format(
-                  header=f"({header})", ppl=ppl,
-                  accu=100*accu, elapse=(time.time()-start_time)/60, lr=lr))
+    event_1 = torch.cuda.Event(enable_timing=True)
+    event_2 = torch.cuda.Event(enable_timing=True)
 
     #valid_accus = []
     valid_losses = []
@@ -185,22 +182,47 @@ def train(model, training_data, validation_data, optimizer, device, opt):
             def __exit__(self, exc_type, exc_value, traceback):
                 return False
 
+        per_batch_training_time = 0
         for epoch_i in range(opt.epoch):
             print('[ Epoch', epoch_i, ']')
             with record_function("## BENCHMARK ##") if opt.collect_execution_graph else dummy_record_function():
+                training_time = 0
                 start = time.time()
+                if opt.cuda:
+                    event_1.record()
                 train_loss, train_accu = train_epoch(
                     model, training_data, optimizer, opt, device, smoothing=opt.label_smoothing)
+                if opt.cuda:
+                    torch.cuda.synchronize()
+                    event_2.record()
+                    torch.cuda.synchronize()
+                training_time = event_1.elapsed_time(event_2) if opt.cuda else (time.time() - start) * 1.e-3
+                per_batch_training_time += training_time / len(training_data)
+
                 train_ppl = math.exp(min(train_loss, 100))
                 # Current learning rate
                 lr = optimizer._optimizer.param_groups[0]['lr']
-                print_performances('Training', train_ppl, train_accu, start, lr)
+                print('  - {header:12} ppl: {ppl: 8.5f}, accuracy: {accu:3.3f} %, lr: {lr:8.5f}, '\
+                    'elapse: {elapse:3.3f} min'.format(
+                        header=f'Training', ppl=train_ppl,
+                        accu=100*train_accu, elapse=(training_time/60), lr=lr))
 
                 if opt.eval:
+                    eval_time = 0
                     start = time.time()
+                    if opt.cuda:
+                        event_1.record()
                     valid_loss, valid_accu = eval_epoch(model, validation_data, device, opt)
+                    if opt.cuda:
+                        torch.cuda.synchronize()
+                        event_2.record()
+                        torch.cuda.synchronize()
+                    eval_time = event_1.elapsed_time(event_2) if opt.cuda else (time.time() - start) * 1.e-3
                     valid_ppl = math.exp(min(valid_loss, 100))
-                    print_performances('Validation', valid_ppl, valid_accu, start, lr)
+                    print('  - {header:12} ppl: {ppl: 8.5f}, accuracy: {accu:3.3f} %, lr: {lr:8.5f}, '\
+                        'elapse: {elapse:3.3f} min'.format(
+                            header=f'Validation', ppl=valid_ppl,
+                            accu=100*valid_accu, elapse=(eval_time/60), lr=lr))
                     valid_losses += [valid_loss]
 
                 checkpoint = {'epoch': epoch_i, 'settings': opt, 'model': model.state_dict()}
@@ -230,6 +252,8 @@ def train(model, training_data, validation_data, optimizer, device, opt):
                     tb_writer.add_scalars('ppl', {'train': train_ppl, 'val': valid_ppl}, epoch_i)
                     tb_writer.add_scalars('accuracy', {'train': train_accu*100, 'val': valid_accu*100}, epoch_i)
                     tb_writer.add_scalar('learning_rate', lr, epoch_i)
+
+        print("Overall per-batch training time: {:.2f} ms".format(per_batch_training_time))
 
     if opt.profile:
         with open("transformer_benchmark.prof", "w") as prof_f:

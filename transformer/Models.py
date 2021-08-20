@@ -54,7 +54,7 @@ class Encoder(nn.Module):
 
         super().__init__()
 
-        import transformer.table_batched_embeddings_ops as table_batched_embeddings_ops
+        import table_batched_embeddings_ops
         self.src_word_emb = table_batched_embeddings_ops.TableBatchedEmbeddingBags(
             1,
             n_src_vocab,
@@ -106,7 +106,7 @@ class Decoder(nn.Module):
 
         super().__init__()
 
-        import transformer.table_batched_embeddings_ops as table_batched_embeddings_ops
+        import table_batched_embeddings_ops
         self.trg_word_emb = table_batched_embeddings_ops.TableBatchedEmbeddingBags(
             1,
             n_trg_vocab,

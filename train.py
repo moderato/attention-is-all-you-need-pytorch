@@ -89,6 +89,7 @@ def train_epoch(model, training_data, optimizer, opt, device, smoothing):
     total_loss, n_word_total, n_word_correct = 0, 0, 0 
 
     desc = '  - (Training)   '
+    batch_count = 0
     for batch in tqdm(training_data, mininterval=2, desc=desc, leave=False):
 
         # prepare data
@@ -114,8 +115,9 @@ def train_epoch(model, training_data, optimizer, opt, device, smoothing):
         n_word_correct += n_correct
         total_loss += loss.item()
 
-        if opt.collect_execution_graph:
+        if opt.collect_execution_graph or batch_count > opt.num_batches:
             break
+        batch_count += 1
 
     loss_per_word = total_loss/n_word_total
     accuracy = n_word_correct/n_word_total
@@ -275,6 +277,7 @@ def main():
 
     parser.add_argument('-epoch', type=int, default=10)
     parser.add_argument('-b', '--batch_size', type=int, default=2048)
+    parser.add_argument('-num_batches', type=int, default=100)
 
     parser.add_argument('-d_model', type=int, default=512)
     parser.add_argument('-d_inner_hid', type=int, default=2048)

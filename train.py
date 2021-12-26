@@ -199,7 +199,9 @@ def train(model, training_data, validation_data, optimizer, device, opt):
                     event_2.record()
                     torch.cuda.synchronize()
                 training_time = event_1.elapsed_time(event_2) if opt.cuda else (time.time() - start) * 1.e-3
-                per_batch_training_time += training_time / len(training_data)
+                per_batch_training_time += training_time / min(len(training_data), opt.num_batches)
+                if opt.num_batches > len(training_data):
+                    opt.num_batches -= len(training_data)
 
                 train_ppl = math.exp(min(train_loss, 100))
                 # Current learning rate
